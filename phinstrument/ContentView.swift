@@ -127,7 +127,7 @@ struct AudioConstants {
     // Absolute limits for sliders
     static let absoluteMinFreq: Double = 20.0       // 20 Hz
     static let absoluteMaxFreq: Double = 20000.0    // 20 kHz
-    static let absoluteMinRate: Double = 0.01   // 10ms
+    static let absoluteMinRate: Double = 0.0001   // 10ms
     static let absoluteMaxRate: Double = 3.0    // 3 seconds
     static let sampleRate: Double = 44100.0
 }
@@ -437,6 +437,8 @@ struct OscilloscopeView: View {
 class AudioManager: ObservableObject {
     private var audioEngine: AVAudioEngine
     private var sourceNode: AVAudioSourceNode?
+    private var recordingFile: AVAudioFile?
+    private var recordingURL: URL?
     
     // Oscilloscope buffer
     private let oscilloscopeBufferSize = 256
@@ -875,6 +877,41 @@ class AudioManager: ObservableObject {
         beepTimer?.invalidate()
         beepTimer = nil
     }
+
+    func startRecording() -> URL? {
+        guard recordingFile == nil else { return recordingURL }
+
+        let format = audioEngine.mainMixerNode.outputFormat(forBus: 0)
+        let filename = "phinstrument-\(Int(Date().timeIntervalSince1970)).caf"
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
+
+        do {
+            recordingFile = try AVAudioFile(forWriting: fileURL, settings: format.settings)
+            recordingURL = fileURL
+            audioEngine.mainMixerNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+                guard let self = self, let file = self.recordingFile else { return }
+                do {
+                    try file.write(from: buffer)
+                } catch {
+                    // Ignore write failures to keep audio running
+                }
+            }
+            return fileURL
+        } catch {
+            recordingFile = nil
+            recordingURL = nil
+            return nil
+        }
+    }
+
+    func stopRecording() -> URL? {
+        guard recordingFile != nil else { return nil }
+        audioEngine.mainMixerNode.removeTap(onBus: 0)
+        let url = recordingURL
+        recordingFile = nil
+        recordingURL = nil
+        return url
+    }
     
     deinit {
         stopBeeping()
@@ -980,6 +1017,7 @@ struct RhythmHelper {
 struct SettingsView: View {
     @Binding var bpm: Double
     @Binding var theme: AppTheme
+    @Binding var holdToPlayEnabled: Bool
     @Environment(\.dismiss) var dismiss
     
     var body: some View {
@@ -1094,6 +1132,29 @@ struct SettingsView: View {
                                 .foregroundColor(theme.textSecondary)
                         }
                         .padding(.bottom, 20)
+
+                        // Playback mode
+                        VStack(spacing: 8) {
+                            HStack {
+                                Text("Hold to Play")
+                                    .font(.headline)
+                                    .foregroundColor(theme.textPrimary)
+                                Spacer()
+                                Toggle("", isOn: $holdToPlayEnabled)
+                                    .labelsHidden()
+                                    .tint(theme.accent)
+                            }
+                            Text("When on, audio plays only while you hold the Play button.")
+                                .font(.caption)
+                                .foregroundColor(theme.textSecondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding()
+                        .background(
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(theme.textPrimary.opacity(0.05))
+                        )
+                        .padding(.horizontal)
                     }
                     .padding(.top, 20)
                 }
@@ -1163,6 +1224,13 @@ struct ContentView: View {
     
     // Legato mode
     @State private var legatoMode: Bool = false
+
+    // Playback + recording
+    @State private var isPlaying: Bool = true
+    @State private var isRecording: Bool = false
+    @State private var holdToPlayEnabled: Bool = false
+    @State private var pendingRecordingURL: URL = FileManager.default.temporaryDirectory.appendingPathComponent("phinstrument-recording.caf")
+    @State private var showRecordingSavePrompt: Bool = false
     
     // Unison, detune, and filter
     @State private var unisonCount: Int = 1
@@ -1191,8 +1259,9 @@ struct ContentView: View {
         ZStack(alignment: .topTrailing) {
             currentTheme.background
                 .ignoresSafeArea()
+                .border(Color.green)
             
-            VStack(spacing: 6) {
+            VStack() {
                 // Oscilloscope
                 OscilloscopeView(samples: oscilloscopeSamples, height: 80, lineColor: currentTheme.oscilloscope)
                     .padding(.horizontal, 20)
@@ -1343,14 +1412,19 @@ struct ContentView: View {
                                     .labelsHidden()
                                     .tint(currentTheme.decay)
                                     .onChange(of: legatoMode) { newValue in
+                                        audioManager.legatoMode = newValue
                                         if newValue {
                                             // Max sustain for legato mode
                                             sustainLevel = 1.0
                                             audioManager.sustainLevel = 1.0
-                                            audioManager.startLegato()
+                                            if isPlaying {
+                                                audioManager.startLegato()
+                                            }
                                         } else {
                                             audioManager.stopLegato()
-                                            audioManager.startBeeping()
+                                            if isPlaying {
+                                                audioManager.startBeeping()
+                                            }
                                         }
                                     }
                             }
@@ -1742,6 +1816,93 @@ struct ContentView: View {
                     }
                 }
                 .padding(.horizontal, 12)
+
+                // Playback + recording controls
+                HStack(spacing: 12) {
+                    Button(action: {
+                        guard !holdToPlayEnabled else { return }
+                        isPlaying.toggle()
+                        if isPlaying {
+                            if legatoMode {
+                                audioManager.startLegato()
+                            } else {
+                                audioManager.startBeeping()
+                            }
+                        } else {
+                            audioManager.stopBeeping()
+                            audioManager.stopLegato()
+                        }
+                    }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                                .font(.system(size: 16, weight: .bold))
+                            Text(isPlaying ? "Pause" : "Play")
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                        }
+                        .padding(.vertical, 8)
+                        .padding(.horizontal, 14)
+                        .foregroundColor(currentTheme.textPrimary)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(currentTheme.textPrimary.opacity(0.1))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { _ in
+                                guard holdToPlayEnabled else { return }
+                                if !isPlaying {
+                                    isPlaying = true
+                                    if legatoMode {
+                                        audioManager.startLegato()
+                                    } else {
+                                        audioManager.startBeeping()
+                                    }
+                                }
+                            }
+                            .onEnded { _ in
+                                guard holdToPlayEnabled else { return }
+                                if isPlaying {
+                                    isPlaying = false
+                                    audioManager.stopBeeping()
+                                    audioManager.stopLegato()
+                                }
+                            }
+                    )
+
+                    Button(action: {
+                        if isRecording {
+                            if let url = audioManager.stopRecording() {
+                                pendingRecordingURL = url
+                                showRecordingSavePrompt = true
+                            }
+                            isRecording = false
+                        } else {
+                            if audioManager.startRecording() != nil {
+                                isRecording = true
+                            }
+                        }
+                    }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: isRecording ? "stop.circle.fill" : "record.circle")
+                                .font(.system(size: 16, weight: .bold))
+                            Text(isRecording ? "Stop" : "Record")
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                        }
+                        .padding(.vertical, 8)
+                        .padding(.horizontal, 14)
+                        .foregroundColor(isRecording ? currentTheme.decay : currentTheme.textPrimary)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(isRecording ? currentTheme.decay.opacity(0.2) : currentTheme.textPrimary.opacity(0.1))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.top, 6)
                 
                 Spacer(minLength: 0)
             }
@@ -1754,7 +1915,7 @@ struct ContentView: View {
                     .padding(12)
                     .contentShape(Rectangle())
             }
-            .padding(.top, 4)
+            // .padding(.top, 4)
             .padding(.trailing, 8)
         }
         .onAppear {
@@ -1772,6 +1933,7 @@ struct ContentView: View {
             audioManager.decayTime = decayTime
             audioManager.sustainLevel = sustainLevel
             audioManager.releaseTime = releaseTime
+            audioManager.legatoMode = legatoMode
             
             // Sync filter and tolerance
             audioManager.filterCutoff = filterCutoff
@@ -1790,7 +1952,13 @@ struct ContentView: View {
                 guard let audioManager = audioManager, !audioManager.rateLocked, !audioManager.legatoMode else { return }
                 audioManager.updateRate(fromPitch: pitch)
             }
-            audioManager.startBeeping()
+            if isPlaying && !holdToPlayEnabled {
+                if legatoMode {
+                    audioManager.startLegato()
+                } else {
+                    audioManager.startBeeping()
+                }
+            }
         }
         .onDisappear {
             // Re-enable idle timer
@@ -1799,12 +1967,31 @@ struct ContentView: View {
             audioManager.stopBeeping()
             motionManager.onRollUpdate = nil
             motionManager.onPitchUpdate = nil
+            if isRecording {
+                _ = audioManager.stopRecording()
+                isRecording = false
+            }
         }
         .sheet(isPresented: $showSettings) {
-            SettingsView(bpm: $bpm, theme: $currentTheme)
+            SettingsView(bpm: $bpm, theme: $currentTheme, holdToPlayEnabled: $holdToPlayEnabled)
+        }
+        .fileMover(isPresented: $showRecordingSavePrompt, file: pendingRecordingURL) { result in
+            switch result {
+            case .success:
+                break
+            case .failure:
+                try? FileManager.default.removeItem(at: pendingRecordingURL)
+            }
         }
         .onChange(of: bpm) { newValue in
             audioManager.bpm = newValue
+        }
+        .onChange(of: holdToPlayEnabled) { newValue in
+            if newValue {
+                isPlaying = false
+                audioManager.stopBeeping()
+                audioManager.stopLegato()
+            }
         }
         .ignoresSafeArea(edges: .bottom)
     }
